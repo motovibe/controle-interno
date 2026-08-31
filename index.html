@@ -338,18 +338,41 @@ function motoMatchesSearch(m, termRaw){
 }
 function historicoPagamentos(motoId){
   const contratos = contratosDaMoto(motoId);
-  let totalCount=0, totalValor=0;
+  const entradasMoto = lancamentosDaMoto(motoId).filter(l=>l.tipo==='entrada');
+
+  // parcelas: agrupadas por periodicidade do contrato (dias/semanas/meses)
+  let parcelaCount=0, parcelaValor=0;
   const porPeriodicidade = {};
   contratos.forEach(c=>{
     const pagos = state.lancamentos.filter(l=>l.contratoId===c.id && l.tipo==='entrada' && l.categoria==='Parcela');
     const count = pagos.length;
     const valor = pagos.reduce((s,l)=>s+Number(l.valor||0),0);
-    totalCount += count; totalValor += valor;
+    parcelaCount += count; parcelaValor += valor;
     if(!porPeriodicidade[c.periodicidade]) porPeriodicidade[c.periodicidade] = {count:0, valor:0};
     porPeriodicidade[c.periodicidade].count += count;
     porPeriodicidade[c.periodicidade].valor += valor;
   });
-  return {totalCount, totalValor, porPeriodicidade, temContratos: contratos.length>0};
+
+  // demais categorias de entrada (caução, outra receita, etc.) — direto pela moto,
+  // sem depender de contrato, pra nunca ficar fora da conta
+  const outrasCategorias = {};
+  entradasMoto.forEach(l=>{
+    if(l.categoria==='Parcela') return;
+    const cat = l.categoria || 'Outra receita';
+    if(!outrasCategorias[cat]) outrasCategorias[cat] = {count:0, valor:0};
+    outrasCategorias[cat].count++;
+    outrasCategorias[cat].valor += Number(l.valor||0);
+  });
+
+  const totalValor = totalEntradas(entradasMoto);
+  const totalCount = entradasMoto.length;
+
+  return {
+    totalCount, totalValor,
+    parcelaCount, parcelaValor,
+    porPeriodicidade, outrasCategorias,
+    temContratos: contratos.length>0, temEntradas: entradasMoto.length>0
+  };
 }
 
 function recomputeContratoStatus(contrato){
@@ -676,14 +699,20 @@ function renderDetail(){
   const linhasPeriodicidade = Object.entries(hist.porPeriodicidade).map(([per,v])=>
     `<div><div class="k">Parcelas ${unidadeAdj(per)}</div><div class="v">${v.count} · ${brl(v.valor)}</div></div>`
   ).join('');
+  const linhasOutrasCategorias = Object.entries(hist.outrasCategorias).map(([cat,v])=>
+    `<div><div class="k">${cat}</div><div class="v">${v.count} · ${brl(v.valor)}</div></div>`
+  ).join('');
   const historicoPagamentosHtml = `
     <div class="section">
       <h3>Pagamentos recebidos <span class="muted-small">todos os contratos, qualquer locatário</span></h3>
-      ${!hist.temContratos ? '<div class="empty">Nenhum contrato registrado ainda nesta moto.</div>' : `
+      ${!hist.temEntradas ? '<div class="empty">Nenhum pagamento registrado ainda nesta moto.</div>' : `
       <div class="kv">
-        <div><div class="k">Total de parcelas recebidas</div><div class="v">${hist.totalCount}</div></div>
-        <div><div class="k">Valor total recebido em parcelas</div><div class="v">${brl(hist.totalValor)}</div></div>
+        <div><div class="k">Valor em parcelas</div><div class="v">${hist.parcelaCount} · ${brl(hist.parcelaValor)}</div></div>
         ${linhasPeriodicidade}
+        ${linhasOutrasCategorias}
+      </div>
+      <div class="kv" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);">
+        <div><div class="k">Total recebido (todas as entradas)</div><div class="v" style="font-weight:600;">${hist.totalCount} · ${brl(hist.totalValor)}</div></div>
       </div>`}
     </div>`;
 
