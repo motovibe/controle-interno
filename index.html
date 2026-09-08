@@ -9,6 +9,7 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
   :root{
     --bg:#e4e3e0;
@@ -193,7 +194,8 @@ let state = { motos: [], contratos: [], lancamentos: [], loaded: false, session:
 let view = {
   screen: 'dashboard', motoId: null, modal: null, modalCtx: null, confirm: null,
   caixaFilter: 'todas', caixaSearch: '', frotaSearch: '', detailDateFrom: '', detailDateTo: '',
-  ultimoBackup: null, importDados: null, importErro: null, importando: false
+  ultimoBackup: null, importDados: null, importErro: null, importando: false,
+  importModo: 'lote', importOcrProgresso: null, importExtratoCabecalho: null, importExtrato: null
 };
 
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
@@ -268,39 +270,71 @@ async function parseExcelFile(file){
   return XLSX.utils.sheet_to_json(sheet, {header:1, defval:'', raw:true});
 }
 
+function clusterizarItensEmLinhas(items, opts){
+  opts = opts || {};
+  const toleranciaY = opts.toleranciaY || 4;
+  const gapColuna = opts.gapColuna || 12;
+  const fatorLargura = opts.fatorLargura || 4.5;
+  const ordemDecrescente = opts.ordemDecrescente !== false; // PDF: y maior = mais acima
+  const linhas = {};
+  items.forEach(it=>{
+    const key = Math.round(it.y/toleranciaY)*toleranciaY;
+    if(!linhas[key]) linhas[key] = [];
+    linhas[key].push(it);
+  });
+  const ys = Object.keys(linhas).map(Number).sort((a,b)=> ordemDecrescente ? b-a : a-b);
+  const allRows = [];
+  ys.forEach(y=>{
+    const itensLinha = linhas[y].slice().sort((a,b)=>a.x-b.x);
+    const colunas = [];
+    let atual = [itensLinha[0]];
+    for(let i=1;i<itensLinha.length;i++){
+      const anterior = atual[atual.length-1];
+      const gap = itensLinha[i].x - (anterior.x + anterior.str.length*fatorLargura);
+      if(gap > gapColuna){ colunas.push(atual); atual = [itensLinha[i]]; }
+      else atual.push(itensLinha[i]);
+    }
+    colunas.push(atual);
+    allRows.push(colunas.map(c=>c.map(it=>it.str).join(' ').trim()));
+  });
+  return allRows;
+}
+function normalizarLargurasLinhas(allRows){
+  const maxCols = Math.max(1, ...allRows.map(r=>r.length));
+  return allRows.map(r=>{ const copy = r.slice(); while(copy.length<maxCols) copy.push(''); return copy; });
+}
+
+async function parseImagemFile(file, onProgresso){
+  const url = URL.createObjectURL(file);
+  try{
+    const resultado = await Tesseract.recognize(url, 'por', {
+      logger: (m)=>{ if(onProgresso && m.status==='recognizing text') onProgresso(Math.round((m.progress||0)*100)); }
+    });
+    const items = [];
+    (resultado.data.words||[]).forEach(w=>{
+      if(!w.text || !w.text.trim()) return;
+      items.push({ str: w.text, x: w.bbox.x0, y: -w.bbox.y0 }); // y negativo pra reaproveitar ordenação "maior=mais acima"
+    });
+    const allRows = clusterizarItensEmLinhas(items, {toleranciaY:8, gapColuna:18, fatorLargura:9, ordemDecrescente:true});
+    return normalizarLargurasLinhas(allRows);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function parsePdfFile(file){
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({data: buf}).promise;
-  const allRows = [];
+  let allRows = [];
   for(let p=1; p<=pdf.numPages; p++){
     const page = await pdf.getPage(p);
     const content = await page.getTextContent();
     const items = content.items
       .map(it=>({str: it.str, x: it.transform[4], y: it.transform[5]}))
       .filter(it=>it.str.trim()!=='');
-    const linhas = {};
-    items.forEach(it=>{
-      const key = Math.round(it.y/4)*4;
-      if(!linhas[key]) linhas[key] = [];
-      linhas[key].push(it);
-    });
-    const ys = Object.keys(linhas).map(Number).sort((a,b)=>b-a);
-    ys.forEach(y=>{
-      const itensLinha = linhas[y].slice().sort((a,b)=>a.x-b.x);
-      const colunas = [];
-      let atual = [itensLinha[0]];
-      for(let i=1;i<itensLinha.length;i++){
-        const anterior = atual[atual.length-1];
-        const gap = itensLinha[i].x - (anterior.x + anterior.str.length*4.5);
-        if(gap > 12){ colunas.push(atual); atual = [itensLinha[i]]; }
-        else atual.push(itensLinha[i]);
-      }
-      colunas.push(atual);
-      allRows.push(colunas.map(c=>c.map(it=>it.str).join(' ').trim()));
-    });
+    allRows = allRows.concat(clusterizarItensEmLinhas(items, {ordemDecrescente:true}));
   }
-  const maxCols = Math.max(1, ...allRows.map(r=>r.length));
-  return allRows.map(r=>{ const copy = r.slice(); while(copy.length<maxCols) copy.push(''); return copy; });
+  return normalizarLargurasLinhas(allRows);
 }
 
 function computarPreviewImport(dados){
@@ -722,21 +756,184 @@ function baixarBackupSQL(){
   render();
 }
 
+function acharValorPorLabel(rows, labels){
+  for(let r=0;r<rows.length;r++){
+    for(let c=0;c<rows[r].length;c++){
+      const cell = (rows[r][c]||'').toString().trim().toLowerCase().replace(/:$/,'');
+      if(labels.some(l=>cell===l)){
+        for(let cc=c+1; cc<rows[r].length; cc++){
+          const v = rows[r][cc];
+          if(v!==undefined && String(v).trim()!==''){ return String(v).trim(); }
+        }
+      }
+    }
+  }
+  return '';
+}
+const STOP_WORDS_IMPORT = ['TOTAL','CUSTOS','SALDO','PREÇO FINAL','PRECO FINAL','LUCRO','COMPRA'];
+function isStopRowImport(v){
+  if(!v) return false;
+  const s = String(v).trim().toUpperCase();
+  return STOP_WORDS_IMPORT.some(sw=>s.startsWith(sw));
+}
+function classificarLancamentoImport(desc, tipo){
+  const d = (desc||'').toString().trim().toLowerCase();
+  if(/semana|mês|mes\b|parceria|master\s*loc/.test(d)) return 'Parcela';
+  if(d.includes('cau')) return 'Caução';
+  if(d.includes('seguro')) return 'Seguro';
+  if(d.includes('rastreador')) return 'Rastreador';
+  if(d.includes('manuten')||d.includes('revis')) return 'Manutenção';
+  if(d.includes('multa')) return 'Multa';
+  if(d.includes('comiss')) return 'Comissão';
+  return tipo==='entrada' ? 'Outra receita' : 'Outra despesa';
+}
+function mapeamentoInicialExtrato(rows){
+  const header = rows[0] || [];
+  const idx = (palavras, fallback) => { const i = chuteColuna(header, palavras); return i>=0 ? i : fallback; };
+  return { data: idx(['data'],0), descricao: idx(['descri'],1), entrada: idx(['entrada'],2), saida: idx(['saída','saida'],3) };
+}
+function extrairLedgerExtrato(dados){
+  const dataRows = dados.hasHeader ? dados.rows.slice(1) : dados.rows.slice();
+  const m = dados.mappingExtrato;
+  const out = [];
+  dataRows.forEach(r=>{
+    const dataRaw = r[m.data], descRaw = r[m.descricao], entRaw = r[m.entrada], saiRaw = r[m.saida];
+    if(isStopRowImport(descRaw) || isStopRowImport(dataRaw)) return;
+    const dataIso = parseDataImport(dataRaw);
+    if(!dataIso) return;
+    const entVal = parseNumeroImport(entRaw), saiVal = parseNumeroImport(saiRaw);
+    const desc = String(descRaw||'').trim();
+    if(entVal>0) out.push({data:dataIso, descricao:desc, valor:entVal, tipo:'entrada', categoria: classificarLancamentoImport(desc,'entrada')});
+    if(saiVal>0) out.push({data:dataIso, descricao:desc, valor:saiVal, tipo:'saida', categoria: classificarLancamentoImport(desc,'saida')});
+  });
+  return out;
+}
+function detectarContratoDoLedger(lancamentos){
+  const fracPattern = /(\d{1,3})\s*\/\s*(\d{1,3})/;
+  const kwOf = (d)=>{ d=(d||'').toLowerCase(); if(d.includes('semana')) return 'Semanal'; if(d.includes('mês')||d.includes('mes')||d.includes('parceria')||d.includes('master')) return 'Mensal'; return null; };
+  const parcelas = lancamentos.filter(l=>l.tipo==='entrada' && l.categoria==='Parcela');
+  if(parcelas.length===0) return {periodicidade:'', prazo:0, valorParcela:0};
+  const ordenadas = parcelas.slice().sort((a,b)=> b.data.localeCompare(a.data));
+  let periodicidade = kwOf(ordenadas[0].descricao) || 'Mensal';
+  let prazo = 0;
+  for(const l of ordenadas){
+    const m = fracPattern.exec(l.descricao||'');
+    if(m){ prazo = parseInt(m[2]); periodicidade = kwOf(l.descricao) || periodicidade; break; }
+  }
+  return {periodicidade, prazo, valorParcela: ordenadas[0].valor};
+}
+function extrairCabecalhoExtrato(rows){
+  return {
+    placa: acharValorPorLabel(rows, ['placa']).toUpperCase(),
+    modelo: acharValorPorLabel(rows, ['modelo moto','modelo']),
+    locatario: acharValorPorLabel(rows, ['locatário','locatario']),
+    contato: acharValorPorLabel(rows, ['contato']),
+    dataInicio: parseDataImport(acharValorPorLabel(rows, ['data inicio contrato','data início contrato','data de entrega','data entrega'])),
+    precoCompra: parseNumeroImport(acharValorPorLabel(rows, ['preço compra','preco compra','compra'])),
+  };
+}
+
 function renderImportar(){
   const dados = view.importDados;
+  const modo = view.importModo || 'lote';
   return `
     <div class="section">
-      <h3>Importar motos em lote</h3>
-      <p style="color:var(--muted);font-size:14px;margin:0 0 14px;">Sobe uma planilha (Excel/CSV) ou um PDF com uma tabela, e cadastra várias motos de uma vez — cada linha vira uma moto, com contrato se tiver os dados do locatário.</p>
-      <div class="field"><label>Arquivo (.xlsx, .csv ou .pdf)</label><input type="file" id="import-file" accept=".xlsx,.xls,.csv,.pdf"></div>
-      ${view.importando ? '<p style="color:var(--muted);font-size:13.5px;">Lendo arquivo…</p>' : ''}
+      <h3>Importar</h3>
+      <p style="color:var(--muted);font-size:14px;margin:0 0 14px;">Sobe uma planilha (Excel/CSV), um PDF ou uma imagem (PNG/JPG) com uma tabela.</p>
+      <div class="filter-bar" style="margin-bottom:14px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13.5px;"><input type="radio" name="import-modo" value="lote" ${modo==='lote'?'checked':''}> Lista de motos (uma linha = uma moto)</label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13.5px;"><input type="radio" name="import-modo" value="extrato" ${modo==='extrato'?'checked':''}> Extrato completo de uma moto (caixa + contrato)</label>
+      </div>
+      <div class="field"><label>Arquivo (.xlsx, .csv, .pdf, .png ou .jpg)</label><input type="file" id="import-file" accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg"></div>
+      ${view.importando ? `<p style="color:var(--muted);font-size:13.5px;">Lendo arquivo${view.importOcrProgresso!==null && view.importOcrProgresso!==undefined ? ' — reconhecendo texto da imagem: '+view.importOcrProgresso+'%' : '…'}</p>` : ''}
       ${view.importErro ? `<div class="modal-error" style="display:block;">${view.importErro}</div>` : ''}
-      ${dados && dados.origem==='pdf' ? '<div class="hint">Extração de PDF é aproximada — confira e corrija a prévia embaixo antes de importar.</div>' : ''}
+      ${dados && (dados.origem==='pdf' || dados.origem==='imagem') ? `<div class="hint">Extração de ${dados.origem==='pdf'?'PDF':'imagem'} é aproximada — confira e corrija a prévia embaixo antes de importar.</div>` : ''}
     </div>
-    ${dados ? renderImportMapeamento(dados) : ''}
-    ${view.importPreviewRows ? renderImportPreview() : ''}
+    ${modo==='lote'
+      ? (dados ? renderImportMapeamento(dados) : '') + (view.importPreviewRows ? renderImportPreview() : '')
+      : (dados ? renderExtratoMapeamento(dados) : '') + (view.importExtrato ? renderExtratoPreview() : '')}
   `;
 }
+
+function renderExtratoMapeamento(dados){
+  const header = dados.rows[0] || [];
+  const m = dados.mappingExtrato;
+  const optsCol = (campo)=> header.map((h,i)=>`<option value="${i}" ${m[campo]===i?'selected':''}>${h || ('Coluna '+(i+1))}</option>`).join('');
+  const cab = view.importExtratoCabecalho || {};
+  return `
+    <div class="section">
+      <h3>Colunas do caixa</h3>
+      <div class="field-grid">
+        <div class="field"><label>Data</label><select data-map-extrato="data">${optsCol('data')}</select></div>
+        <div class="field"><label>Descrição</label><select data-map-extrato="descricao">${optsCol('descricao')}</select></div>
+        <div class="field"><label>Entrada</label><select data-map-extrato="entrada">${optsCol('entrada')}</select></div>
+        <div class="field"><label>Saída</label><select data-map-extrato="saida">${optsCol('saida')}</select></div>
+      </div>
+    </div>
+    <div class="section">
+      <h3>Dados da moto e do contrato <span class="muted-small">detectados automaticamente — confira</span></h3>
+      <div class="field-grid">
+        <div class="field"><label>Placa *</label><input id="extrato-placa" value="${cab.placa||''}"></div>
+        <div class="field"><label>Modelo</label><input id="extrato-modelo" value="${(cab.modelo||'').replace(/"/g,'&quot;')}"></div>
+        <div class="field"><label>Locatário</label><input id="extrato-locatario" value="${(cab.locatario||'').replace(/"/g,'&quot;')}"></div>
+        <div class="field"><label>Contato</label><input id="extrato-contato" value="${(cab.contato||'').replace(/"/g,'&quot;')}"></div>
+        <div class="field"><label>Data início contrato</label><input type="date" id="extrato-datainicio" value="${cab.dataInicio||''}"></div>
+        <div class="field"><label>Preço de compra</label><input type="number" step="0.01" id="extrato-precocompra" value="${cab.precoCompra||0}"></div>
+      </div>
+      <div class="modal-actions" style="justify-content:flex-start;margin-top:10px;">
+        <button class="btn" id="btn-gerar-previa-extrato">Gerar prévia</button>
+      </div>
+    </div>`;
+}
+
+function renderExtratoPreview(){
+  const ex = view.importExtrato;
+  const linhas = ex.lancamentos.map((l,i)=>`
+    <tr>
+      <td><input type="date" data-extlanc="data" data-i="${i}" value="${l.data}" style="width:110px;"></td>
+      <td><select data-extlanc="tipo" data-i="${i}">
+            <option value="entrada" ${l.tipo==='entrada'?'selected':''}>Entrada</option>
+            <option value="saida" ${l.tipo==='saida'?'selected':''}>Saída</option>
+          </select></td>
+      <td><input data-extlanc="categoria" data-i="${i}" value="${(l.categoria||'').replace(/"/g,'&quot;')}" style="width:100px;"></td>
+      <td><input data-extlanc="descricao" data-i="${i}" value="${(l.descricao||'').replace(/"/g,'&quot;')}" style="width:160px;"></td>
+      <td><input type="number" step="0.01" data-extlanc="valor" data-i="${i}" value="${l.valor}" style="width:90px;"></td>
+      <td><button class="del-x" data-del-extlanc="${i}">✕</button></td>
+    </tr>`).join('');
+  return `
+    <div class="section">
+      <h3>Contrato detectado <span class="muted-small">confira antes de importar</span></h3>
+      <div class="field-grid">
+        <div class="field"><label>Periodicidade</label>
+          <select id="extrato-periodicidade">
+            <option value="" ${!ex.periodicidade?'selected':''}>Sem contrato</option>
+            <option value="Mensal" ${ex.periodicidade==='Mensal'?'selected':''}>Mensal</option>
+            <option value="Semanal" ${ex.periodicidade==='Semanal'?'selected':''}>Semanal</option>
+            <option value="Diária" ${ex.periodicidade==='Diária'?'selected':''}>Diária</option>
+          </select>
+        </div>
+        <div class="field"><label>Prazo (nº de parcelas)</label><input type="number" id="extrato-prazo" value="${ex.prazo||0}"></div>
+        <div class="field"><label>Valor da parcela</label><input type="number" step="0.01" id="extrato-valorparcela" value="${ex.valorParcela||0}"></div>
+        <div class="field"><label>Valor total do contrato</label><input type="number" step="0.01" id="extrato-valortotal" value="${ex.valorTotal||0}"></div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="row-actions"><h3 style="margin:0;">Caixa desta moto <span class="muted-small">${ex.lancamentos.length} lançamentos</span></h3></div>
+      <div class="lanc-wrap" style="max-height:400px;">
+        <table><thead><tr><th>Data</th><th>Tipo</th><th>Categoria</th><th>Descrição</th><th>Valor</th><th></th></tr></thead>
+          <tbody>${linhas}</tbody>
+        </table>
+      </div>
+      <button class="btn secondary small" id="btn-add-extlanc" style="margin-top:8px;">+ Lançamento</button>
+      <div class="modal-actions" style="justify-content:flex-start;margin-top:14px;">
+        <button class="btn" id="btn-confirmar-extrato" ${!ex.placa?'disabled':''}>Importar esta moto</button>
+        <button class="btn secondary" id="btn-cancelar-extrato">Cancelar</button>
+      </div>
+      ${!ex.placa ? '<div class="hint">Preencha a placa acima antes de importar.</div>' : ''}
+    </div>`;
+}
+
+
 
 function renderImportMapeamento(dados){
   const opts = (campoKey)=>{
@@ -1438,28 +1635,127 @@ function attachModalEvents(kind){
 
 // ---------- events ----------
 function attachEvents(){
+  document.querySelectorAll('input[name="import-modo"]').forEach(r=>{
+    r.addEventListener('change', (e)=>{
+      view.importModo = e.target.value;
+      view.importDados = null; view.importPreviewRows = null; view.importErro = null;
+      view.importExtrato = null; view.importExtratoCabecalho = null;
+      render();
+    });
+  });
+
   document.getElementById('import-file')?.addEventListener('change', async (e)=>{
     const file = e.target.files[0];
     if(!file) return;
-    view.importErro = null; view.importDados = null; view.importPreviewRows = null; view.importando = true;
+    view.importErro = null; view.importDados = null; view.importPreviewRows = null;
+    view.importExtrato = null; view.importExtratoCabecalho = null;
+    view.importando = true; view.importOcrProgresso = null;
     render();
     try{
       const nome = file.name.toLowerCase();
       let rows, origem;
       if(nome.endsWith('.pdf')){
         rows = await parsePdfFile(file); origem = 'pdf';
+      } else if(nome.endsWith('.png') || nome.endsWith('.jpg') || nome.endsWith('.jpeg')){
+        rows = await parseImagemFile(file, (pct)=>{ view.importOcrProgresso = pct; render(); }); origem = 'imagem';
       } else {
         rows = await parseExcelFile(file); origem = 'excel';
       }
       rows = rows.filter(r=>r.some(c=>String(c).trim()!==''));
       if(rows.length===0){ throw new Error('Não encontrei nenhuma linha com dado nesse arquivo.'); }
       const headers = rows[0].map(h=>String(h||'').trim());
-      view.importDados = { headers, rows, hasHeader: true, mapping: mapeamentoInicial(headers), origem };
+      if(view.importModo==='extrato'){
+        view.importDados = { headers, rows, hasHeader: true, mappingExtrato: mapeamentoInicialExtrato(rows), origem };
+        view.importExtratoCabecalho = extrairCabecalhoExtrato(rows);
+      } else {
+        view.importDados = { headers, rows, hasHeader: true, mapping: mapeamentoInicial(headers), origem };
+      }
     }catch(err){
       view.importErro = 'Não consegui ler o arquivo: ' + err.message;
     }
-    view.importando = false;
+    view.importando = false; view.importOcrProgresso = null;
     render();
+  });
+
+  document.querySelectorAll('[data-map-extrato]').forEach(sel=>{
+    sel.addEventListener('change', (e)=>{
+      view.importDados.mappingExtrato[sel.getAttribute('data-map-extrato')] = parseInt(e.target.value);
+    });
+  });
+  document.getElementById('btn-gerar-previa-extrato')?.addEventListener('click', ()=>{
+    const cab = {
+      placa: document.getElementById('extrato-placa').value.trim().toUpperCase(),
+      modelo: document.getElementById('extrato-modelo').value.trim(),
+      locatario: document.getElementById('extrato-locatario').value.trim(),
+      contato: document.getElementById('extrato-contato').value.trim(),
+      dataInicio: document.getElementById('extrato-datainicio').value,
+      precoCompra: parseFloat(document.getElementById('extrato-precocompra').value)||0,
+    };
+    const lancamentos = extrairLedgerExtrato(view.importDados);
+    const contratoDetectado = detectarContratoDoLedger(lancamentos);
+    view.importExtrato = {
+      ...cab,
+      periodicidade: contratoDetectado.periodicidade,
+      prazo: contratoDetectado.prazo,
+      valorParcela: contratoDetectado.valorParcela,
+      valorTotal: contratoDetectado.valorParcela * contratoDetectado.prazo,
+      lancamentos
+    };
+    render();
+  });
+  document.getElementById('extrato-periodicidade')?.addEventListener('change', (e)=>{ view.importExtrato.periodicidade = e.target.value; });
+  document.getElementById('extrato-prazo')?.addEventListener('input', (e)=>{ view.importExtrato.prazo = parseInt(e.target.value)||0; });
+  document.getElementById('extrato-valorparcela')?.addEventListener('input', (e)=>{ view.importExtrato.valorParcela = parseFloat(e.target.value)||0; });
+  document.getElementById('extrato-valortotal')?.addEventListener('input', (e)=>{ view.importExtrato.valorTotal = parseFloat(e.target.value)||0; });
+  document.querySelectorAll('[data-extlanc]').forEach(el=>{
+    el.addEventListener('input', ()=>{
+      const campo = el.getAttribute('data-extlanc');
+      const i = parseInt(el.getAttribute('data-i'));
+      view.importExtrato.lancamentos[i][campo] = campo==='valor' ? (parseFloat(el.value)||0) : el.value;
+    });
+  });
+  document.querySelectorAll('[data-del-extlanc]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      view.importExtrato.lancamentos.splice(parseInt(el.getAttribute('data-del-extlanc')), 1);
+      render();
+    });
+  });
+  document.getElementById('btn-add-extlanc')?.addEventListener('click', ()=>{
+    view.importExtrato.lancamentos.push({data: todayISO(), tipo:'entrada', categoria:'Parcela', descricao:'', valor:0});
+    render();
+  });
+  document.getElementById('btn-cancelar-extrato')?.addEventListener('click', ()=>{
+    view.importDados = null; view.importExtrato = null; view.importExtratoCabecalho = null; view.importErro = null;
+    render();
+  });
+  document.getElementById('btn-confirmar-extrato')?.addEventListener('click', async ()=>{
+    const ex = view.importExtrato;
+    if(!ex.placa) return;
+    view.importando = true; render();
+    try{
+      const novaMoto = await criarMoto(ex.placa, ex.modelo || 'Não informado', ex.dataInicio || null, ex.precoCompra || 0);
+      if(ex.periodicidade && ex.prazo){
+        await criarContrato(novaMoto.id, {
+          locatario: ex.locatario || 'Não informado', contato: ex.contato,
+          dataInicio: ex.dataInicio || null, periodicidade: ex.periodicidade,
+          valorParcela: ex.valorParcela, prazo: ex.prazo, valorTotal: ex.valorTotal
+        });
+      }
+      for(const l of ex.lancamentos){
+        await criarLancamento(novaMoto.id, {
+          data: l.data, tipo: l.tipo, categoria: l.categoria, descricao: l.descricao || l.categoria, valor: l.valor,
+        });
+      }
+      view.importando = false;
+      view.importDados = null; view.importExtrato = null; view.importExtratoCabecalho = null;
+      view.screen = 'frota';
+      render();
+      showAlert(`Moto ${ex.placa} importada com ${ex.lancamentos.length} lançamentos.`);
+    }catch(err){
+      view.importando = false;
+      view.importErro = 'Erro ao importar: ' + err.message;
+      render();
+    }
   });
 
   document.getElementById('import-tem-cabecalho')?.addEventListener('change', (e)=>{
