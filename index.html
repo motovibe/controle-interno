@@ -95,6 +95,8 @@
   .badge.ativa{background:var(--amber-dim);color:var(--amber-text);}
   .badge.disponivel{background:var(--surface-2);color:var(--muted);}
   .badge.encerrada{background:var(--green-dim);color:var(--green);}
+  .badge-contrato-ativo{background:var(--green-dim);color:var(--green);}
+  .badge-contrato-encerrado{background:var(--red-dim);color:var(--red);}
   .card .locatario{margin-top:10px;font-size:14px;}
   .progress-wrap{margin-top:10px;height:5px;background:var(--surface-2);border-radius:3px;overflow:hidden;}
   .progress-bar{height:100%;background:var(--amber);}
@@ -688,7 +690,6 @@ function renderDetail(){
   if(!moto){ view.screen='frota'; return renderShell(); }
   const st = statusMoto(moto);
   const contratoAt = contratoAtivo(moto.id);
-  const historico = contratosDaMoto(moto.id).filter(c=>c.status==='Encerrado');
   const lancMoto = lancamentosDaMoto(moto.id);
   const entradasTotal = totalEntradas(lancMoto);
   const saidasTotal = totalSaidas(lancMoto);
@@ -702,6 +703,25 @@ function renderDetail(){
   const linhasOutrasCategorias = Object.entries(hist.outrasCategorias).map(([cat,v])=>
     `<div><div class="k">${cat}</div><div class="v">${v.count} · ${brl(v.valor)}</div></div>`
   ).join('');
+  const todosContratos = contratosDaMoto(moto.id);
+  const linhasContratos = todosContratos.map(c=>{
+    const ativo = c.status==='Ativo';
+    return `<tr>
+      <td>${c.locatario}</td>
+      <td>${fmtDate(c.dataInicio)}</td>
+      <td>${ativo ? '—' : fmtDate(c.dataEncerramento)}</td>
+      <td>${c.periodicidade||'—'}</td>
+      <td>${brl(c.valorTotal)}</td>
+      <td><span class="badge ${ativo?'badge-contrato-ativo':'badge-contrato-encerrado'}">${ativo?'Ativo':'Encerrado'}</span></td>
+    </tr>`;
+  }).join('');
+  const tabelaContratosHtml = todosContratos.length ? `
+    <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);">
+      <div class="section-label-inline" style="font-size:13px;font-weight:600;margin-bottom:8px;">Contratos desta moto <span class="muted-small">${todosContratos.length}</span></div>
+      <table><thead><tr><th>Locatário</th><th>Início</th><th>Encerrado em</th><th>Periodicidade</th><th>Valor total</th><th>Status</th></tr></thead>
+        <tbody>${linhasContratos}</tbody>
+      </table>
+    </div>` : '';
   const historicoPagamentosHtml = `
     <div class="section">
       <h3>Pagamentos recebidos <span class="muted-small">todos os contratos, qualquer locatário</span></h3>
@@ -714,6 +734,7 @@ function renderDetail(){
       <div class="kv" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);">
         <div><div class="k">Total recebido (todas as entradas)</div><div class="v" style="font-weight:600;">${hist.totalCount} · ${brl(hist.totalValor)}</div></div>
       </div>`}
+      ${tabelaContratosHtml}
     </div>`;
 
   let contratoSection;
@@ -746,14 +767,6 @@ function renderDetail(){
         <button class="btn" id="btn-novo-contrato">+ Novo contrato</button>
       </div>`;
   }
-
-  const historicoContratosHtml = historico.length ? `
-    <div class="section">
-      <h3>Contratos anteriores <span class="muted-small">${historico.length}</span></h3>
-      <table><thead><tr><th>Locatário</th><th>Início</th><th>Encerrado em</th><th>Valor total</th></tr></thead><tbody>
-        ${historico.map(c=>`<tr><td>${c.locatario}</td><td>${fmtDate(c.dataInicio)}</td><td>${fmtDate(c.dataEncerramento)}</td><td>${brl(c.valorTotal)}</td></tr>`).join('')}
-      </tbody></table>
-    </div>` : '';
 
   let lancFiltrados = lancMoto.slice();
   if(view.detailDateFrom) lancFiltrados = lancFiltrados.filter(l => l.data >= view.detailDateFrom);
@@ -808,8 +821,6 @@ function renderDetail(){
         <div class="fin-item"><div class="v">${projecao!==null? brl(projecao) : '—'}</div><div class="k">Projeção se concluir contrato</div></div>
       </div>
     </div>
-
-    ${historicoContratosHtml}
 
     <div class="section">
       <div class="row-actions"><h3 style="margin:0;">Caixa da moto</h3></div>
