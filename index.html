@@ -952,6 +952,20 @@ function renderModal(){
 }
 
 function modalContent(kind){
+  if(kind==='encerrar-contrato'){
+    const c = state.contratos.find(c=>c.id===view.modalCtx.contratoId);
+    return `<div class="modal">
+      <h3>Encerrar contrato</h3>
+      <p style="font-size:14px;margin:0 0 14px;">Encerrar o contrato de <b>${c.locatario}</b>? A moto volta a ficar disponível para um novo contrato.</p>
+      <div class="field"><label>Data do encerramento</label><input id="f-dataencerramento" type="date" value="${todayISO()}"></div>
+      <div class="hint">Se o contrato encerrou de verdade em outro dia, pode ajustar aqui — não precisa ser hoje.</div>
+      <div class="modal-error" id="modal-error"></div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="m-cancel">Cancelar</button>
+        <button class="btn danger" id="m-save" style="background:var(--red);color:#fff;border:none;">Encerrar contrato</button>
+      </div>
+    </div>`;
+  }
   if(kind==='nova-moto'){
     return `<div class="modal">
       <h3>Nova moto</h3>
@@ -1162,7 +1176,18 @@ function attachModalEvents(kind){
 
   document.getElementById('m-save')?.addEventListener('click', async ()=>{
     const saveBtn = document.getElementById('m-save');
-    if(kind==='nova-moto'){
+    if(kind==='encerrar-contrato'){
+      const dataEncerramento = document.getElementById('f-dataencerramento').value;
+      if(!dataEncerramento){ showModalError('Escolha a data do encerramento.'); return; }
+      saveBtn.disabled = true;
+      const c = state.contratos.find(c=>c.id===view.modalCtx.contratoId);
+      try{
+        c.status='Encerrado'; c.avisoLido=true; c.dataEncerramento=dataEncerramento;
+        view.modal=null; view.modalCtx=null; render();
+        await atualizarContrato(c.id, {status:'Encerrado', aviso_lido:true, data_encerramento:dataEncerramento});
+      }catch(err){ showModalError('Erro ao encerrar: ' + err.message); saveBtn.disabled = false; }
+    }
+    else if(kind==='nova-moto'){
       const placa = document.getElementById('f-placa').value.trim().toUpperCase();
       const modelo = document.getElementById('f-modelo').value.trim();
       const dataCompra = document.getElementById('f-datacompra').value;
@@ -1322,11 +1347,9 @@ function attachEvents(){
   document.getElementById('btn-encerrar')?.addEventListener('click', ()=>{
     const c = contratoAtivo(view.motoId);
     if(!c) return;
-    askConfirm(`Encerrar o contrato de <b>${c.locatario}</b> manualmente? A moto volta a ficar disponível para um novo contrato.`, ()=>{
-      c.status='Encerrado'; c.avisoLido=true; c.dataEncerramento=todayISO();
-      render();
-      atualizarContrato(c.id, {status:'Encerrado', aviso_lido:true, data_encerramento:c.dataEncerramento});
-    });
+    view.modalCtx = {contratoId: c.id};
+    view.modal = 'encerrar-contrato';
+    render();
   });
 
   document.querySelectorAll('.tab-btn').forEach(elm=>{
